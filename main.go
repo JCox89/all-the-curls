@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"os"
 	"path"
+	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
@@ -39,7 +41,7 @@ func main() {
 	var version string
 	var interactive bool
 
-	flag.StringVar(&schemaPath, "schema", "", "Path to GraphQL schema SDL (.graphql/.gql)")
+	flag.StringVar(&schemaPath, "schema", "", "Schema path: file, directory (recursively loads .graphql/.gql), or comma-separated list of paths")
 	flag.StringVar(&queryPath, "query", "", "Path to GraphQL query document (.graphql/.gql)")
 	flag.StringVar(&endpoint, "endpoint", "", "GraphQL HTTP endpoint URL")
 	flag.StringVar(&operationName, "operation", "", "Operation name to document (if multiple in query doc)")
@@ -67,13 +69,19 @@ func main() {
 		fatalf("--schema, --query, and --endpoint are required")
 	}
 
-	schemaSDL, err := ioutil.ReadFile(schemaPath)
+	// Support stitched schemas: allow --schema to be a directory or a comma-separated list of files/dirs
+	sources, err := collectSchemaSources(schemaPath)
 	if err != nil {
-		fatalf("failed to read schema: %v", err)
+		fatalf("failed to read schema sources: %v", err)
 	}
-	gqlSchema, err := gqlparser.LoadSchema(&ast.Source{Name: path.Base(schemaPath), Input: string(schemaSDL)})
+	gqlSchema, err := gqlparser.LoadSchema(sources...)
 	if err != nil {
-		fatalf("failed to parse schema: %v", err)
+		// Provide a more helpful error including the list of sources
+		names := make([]string, 0, len(sources))
+		for _, s := range sources {
+			names = append(names, s.Name)
+		}
+		fatalf("failed to parse schema from %s: %v\nHint: For stitched schemas, pass a directory or comma-separated list of all SDL files.", strings.Join(names, ", "), err)
 	}
 
 	queryDocBytes, err := ioutil.ReadFile(queryPath)
@@ -405,6 +413,61 @@ func opNameOrDefault(q string) string {
 		}
 	}
 	return "(anonymous)"
+}
+
+func collectSchemaSources(schemaArg string) ([]*ast.Source, error) {
+	parts := strings.Split(schemaArg, ",")
+	var files []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		fi, err := os.Stat(p)
+		if err != nil {
+			return nil, fmt.Errorf("schema path not found: %s", p)
+		}
+		if fi.IsDir() {
+			// collect all .graphql/.gql files recursively
+			err = filepath.Walk(p, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return err
+				}
+				if info.IsDir() {
+					return nil
+				}
+				ext := strings.ToLower(filepath.Ext(path))
+				if ext == ".graphql" || ext == ".gql" {
+					files = append(files, path)
+				}
+				return nil
+			})
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			ext := strings.ToLower(filepath.Ext(p))
+			if ext == ".graphql" || ext == ".gql" {
+				files = append(files, p)
+			} else {
+				return nil, fmt.Errorf("unsupported schema file extension (want .graphql/.gql): %s", p)
+			}
+		}
+	}
+	if len(files) == 0 {
+		return nil, fmt.Errorf("no .graphql/.gql files found from --schema input")
+	}
+	// stable order
+	sort.Strings(files)
+	sources := make([]*ast.Source, 0, len(files))
+	for _, f := range files {
+		b, err := ioutil.ReadFile(f)
+		if err != nil {
+			return nil, err
+		}
+		sources = append(sources, &ast.Source{Name: filepath.ToSlash(f), Input: string(b)})
+	}
+	return sources, nil
 }
 
 func writeSpec(spec *openapi3.T, outPath, format string) error {
