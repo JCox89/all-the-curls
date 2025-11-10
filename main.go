@@ -40,6 +40,8 @@ func main() {
 	var title string
 	var version string
 	var interactive bool
+	var federated bool
+	var gatewayName string
 
 	flag.StringVar(&schemaPath, "schema", "", "Schema path: file, directory (recursively loads .graphql/.gql), or comma-separated list of paths")
 	flag.StringVar(&queryPath, "query", "", "Path to GraphQL query document (.graphql/.gql)")
@@ -51,6 +53,8 @@ func main() {
 	flag.StringVar(&title, "title", "GraphQL as REST", "OpenAPI document title")
 	flag.StringVar(&version, "version", "1.0.0", "OpenAPI document version")
 	flag.BoolVar(&interactive, "interactive", false, "Prompt for missing inputs interactively")
+	flag.BoolVar(&federated, "federated", false, "Enable Apollo Federation subgraph SDL support (inject directives and stubs)")
+	flag.StringVar(&gatewayName, "gateway-name", "", "Optional display name for the GraphQL gateway (shown in spec metadata)")
 	flag.Parse()
 
 	if (schemaPath == "" || queryPath == "" || endpoint == "") && interactiveEnabled(interactive) {
@@ -74,6 +78,19 @@ func main() {
 	if err != nil {
 		fatalf("failed to read schema sources: %v", err)
 	}
+	// Federated schema support: detect and preprocess if enabled or detected
+	if !federated && interactiveEnabled(interactive) && detectFederation(sources) {
+		if promptYesNo("Detected federation directives. Enable federated mode?", true) {
+			federated = true
+		}
+	}
+	if federated {
+		if interactiveEnabled(interactive) && gatewayName == "" {
+			gatewayName = promptString("Gateway name (for display)", "")
+		}
+		sources = preprocessFederationSources(sources)
+	}
+
 	gqlSchema, err := gqlparser.LoadSchema(sources...)
 	if err != nil {
 		// Provide a more helpful error including the list of sources
@@ -81,7 +98,7 @@ func main() {
 		for _, s := range sources {
 			names = append(names, s.Name)
 		}
-		fatalf("failed to parse schema from %s: %v\nHint: For stitched schemas, pass a directory or comma-separated list of all SDL files.", strings.Join(names, ", "), err)
+		fatalf("failed to parse schema from %s: %v\nHint: For stitched or federated schemas, pass a directory or comma-separated list of all SDL files. For federated subgraphs, try --federated.", strings.Join(names, ", "), err)
 	}
 
 	queryDocBytes, err := ioutil.ReadFile(queryPath)
@@ -135,7 +152,7 @@ func main() {
 		exampleVars = buildVariablesExample(gqlSchema, op)
 	}
 
-	spec, err := buildOpenAPISpec(title, version, endpoint, string(queryDocBytes), varSchemaRef, required)
+ spec, err := buildOpenAPISpec(title, version, endpoint, string(queryDocBytes), varSchemaRef, required, gatewayName)
 	if err != nil {
 		fatalf("failed to build OpenAPI spec: %v", err)
 	}
@@ -178,7 +195,11 @@ func main() {
 
 	// Print curl example to stdout
 	curl := buildCurl(endpoint, string(queryDocBytes), exampleVars)
-	fmt.Println("\n# Example curl:\n" + curl)
+	if gatewayName != "" {
+		fmt.Printf("\n# Example curl (via %s):\n%s\n", gatewayName, curl)
+	} else {
+		fmt.Println("\n# Example curl:\n" + curl)
+	}
 }
 
 func fatalf(f string, a ...any) {
@@ -337,7 +358,7 @@ func exampleForType(schema *ast.Schema, t *ast.Type) any {
 	}
 }
 
-func buildOpenAPISpec(title, version, endpoint, query string, varsSchema *openapi3.SchemaRef, required []string) (*openapi3.T, error) {
+func buildOpenAPISpec(title, version, endpoint, query string, varsSchema *openapi3.SchemaRef, required []string, gatewayName string) (*openapi3.T, error) {
 	u, err := url.Parse(endpoint)
 	if err != nil {
 		return nil, err
@@ -348,6 +369,10 @@ func buildOpenAPISpec(title, version, endpoint, query string, varsSchema *openap
 		p = "/graphql"
 	}
 
+ // Annotate title/description if going through a gateway
+ if gatewayName != "" {
+     title = fmt.Sprintf("%s (via %s)", title, gatewayName)
+ }
 	spec := &openapi3.T{
 		OpenAPI: "3.0.3",
 		Info: &openapi3.Info{
@@ -357,6 +382,20 @@ func buildOpenAPISpec(title, version, endpoint, query string, varsSchema *openap
 		},
 		Servers: openapi3.Servers{{URL: serverURL}},
 		Paths:   openapi3.NewPaths(),
+	}
+	// Add gateway metadata extension if provided
+	if gatewayName != "" {
+		if spec.Info.Extensions == nil {
+			spec.Info.Extensions = make(map[string]any)
+		}
+		spec.Info.Extensions["x-graphql-gateway-name"] = gatewayName
+		desc := spec.Info.Description
+		if desc == "" {
+			desc = fmt.Sprintf("Requests are executed via gateway %s.", gatewayName)
+		} else {
+			desc = desc + "\n\n" + fmt.Sprintf("Requests are executed via gateway %s.", gatewayName)
+		}
+		spec.Info.Description = desc
 	}
 
 	// Request body schema: { query: string, variables: <varsSchema> }
@@ -413,6 +452,80 @@ func opNameOrDefault(q string) string {
 		}
 	}
 	return "(anonymous)"
+}
+
+// --- Federation helpers ---
+func detectFederation(sources []*ast.Source) bool {
+	for _, s := range sources {
+		inp := s.Input
+		if strings.Contains(inp, "@key(") || strings.Contains(inp, "@requires(") || strings.Contains(inp, "@provides(") || strings.Contains(inp, "extend type ") || strings.Contains(inp, "extend interface ") {
+			return true
+		}
+	}
+	return false
+}
+
+func preprocessFederationSources(sources []*ast.Source) []*ast.Source {
+	// Minimal Apollo Federation v2 directives and scalar to make gqlparser accept subgraph SDL
+	federationPrelude := `
+	scalar _FieldSet
+	
+	directive @extends on OBJECT | INTERFACE
+	directive @external on OBJECT | FIELD_DEFINITION
+	directive @requires(fields: _FieldSet!) on FIELD_DEFINITION
+	directive @provides(fields: _FieldSet!) on FIELD_DEFINITION
+	directive @key(fields: _FieldSet!, resolvable: Boolean = true) repeatable on OBJECT | INTERFACE
+	directive @shareable on OBJECT | FIELD_DEFINITION
+	directive @inaccessible on FIELD_DEFINITION | OBJECT | INTERFACE | UNION | ENUM | INPUT_OBJECT | SCALAR | ARGUMENT_DEFINITION | ENUM_VALUE | INPUT_FIELD_DEFINITION
+	directive @override(from: String!) on FIELD_DEFINITION
+	`
+
+	// Collect type names that are extended without base declarations
+	extended := map[string]bool{}
+	hasBase := map[string]bool{}
+	for _, s := range sources {
+		lines := strings.Split(s.Input, "\n")
+		for _, ln := range lines {
+			l := strings.TrimSpace(ln)
+			if strings.HasPrefix(l, "type ") || strings.HasPrefix(l, "interface ") || strings.HasPrefix(l, "input ") || strings.HasPrefix(l, "enum ") || strings.HasPrefix(l, "scalar ") || strings.HasPrefix(l, "union ") {
+				// mark base declaration
+				parts := strings.Fields(l)
+				if len(parts) >= 2 {
+					hasBase[parts[1]] = true
+				}
+			}
+			if strings.HasPrefix(l, "extend type ") {
+				parts := strings.Fields(l)
+				if len(parts) >= 3 {
+					extended[parts[2]] = true
+				}
+			}
+			if strings.HasPrefix(l, "extend interface ") {
+				parts := strings.Fields(l)
+				if len(parts) >= 3 {
+					extended[parts[2]] = true
+				}
+			}
+		}
+	}
+
+	// Build stubs for any extended types without base
+	var stubs []string
+	for name := range extended {
+		if !hasBase[name] {
+			stubs = append(stubs, fmt.Sprintf("type %s { _stub: String }", name))
+		}
+	}
+	stubSDL := strings.Join(stubs, "\n")
+
+	// Prepend the federation prelude and stubs as synthetic sources
+	prepended := make([]*ast.Source, 0, len(sources)+2)
+	prepended = append(prepended, &ast.Source{Name: "__federation.graphql", Input: federationPrelude})
+	if stubSDL != "" {
+		prepended = append(prepended, &ast.Source{Name: "__federation_stubs.graphql", Input: stubSDL})
+	}
+	prepended = append(prepended, sources...)
+	return prepended
 }
 
 func collectSchemaSources(schemaArg string) ([]*ast.Source, error) {
